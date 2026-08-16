@@ -10,6 +10,7 @@ import {
   routineSuggestions,
 } from "./data";
 import { AnalysisPage, type AnalysisResult } from "./analysis";
+import { isSupabaseConfigured, supabase } from "./supabaseClient";
 
 type Category =
   | "Skin"
@@ -107,6 +108,8 @@ const tabs: { id: NavTab; label: string }[] = [
   { id: "profile", label: "Profile" },
 ];
 const defaultGoals: Goals = { water: 8, sleep: 7.5, steps: 8000, workout: 4 };
+const authStorageKey = "vantaface-auth-v1";
+const authAccountsKey = "vantaface-accounts-v1";
 const initialState: AppState = {
   onboarded: false,
   activeTab: "dashboard",
@@ -121,6 +124,7 @@ const initialState: AppState = {
 
 export function AppShell() {
   const [state, setState] = usePersistentState();
+  const [signedIn, setSignedIn] = useAuthState();
   const [modal, setModal] = useState<ModalName | null>(null);
   const [celebrate, setCelebrate] = useState(false);
   const completed = state.routines.filter((routine) => routine.done).length;
@@ -204,11 +208,21 @@ export function AppShell() {
     patch({ analyses: [analysis, ...state.analyses.filter((item) => item.id !== analysis.id)] });
   }
 
+  async function signOut() {
+    if (supabase) {
+      await supabase.auth.signOut();
+    }
+    window.localStorage.removeItem(authStorageKey);
+    setSignedIn(false);
+  }
+
   return (
     <main className="appRoot">
       <div className="ambient one" />
       <div className="ambient two" />
-      {!state.onboarded ? (
+      {!signedIn ? (
+        <AuthPage onAuth={() => setSignedIn(true)} />
+      ) : !state.onboarded ? (
         <Onboarding onFinish={openDashboardFromOnboarding} />
       ) : (
         <>
@@ -272,6 +286,7 @@ export function AppShell() {
                     goals={state.goals}
                     focusAreas={state.focusAreas}
                     onGoalClick={() => setModal("goals")}
+                    onSignOut={signOut}
                   />
                 )}
               </div>
@@ -306,6 +321,258 @@ export function AppShell() {
         </>
       )}
     </main>
+  );
+}
+
+function AuthPage({ onAuth }: { onAuth: () => void }) {
+  const [mode, setMode] = useState<"login" | "signup">("login");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [name, setName] = useState("");
+  const [message, setMessage] = useState("");
+  const headline = mode === "login" ? "Welcome Back!" : "Start Free";
+  const subtitle =
+    mode === "login"
+      ? "Log in to continue monitoring your signals."
+      : "Create your VantaFace profile and begin your glow-up plan.";
+
+  function readAccounts() {
+    try {
+      return JSON.parse(window.localStorage.getItem(authAccountsKey) ?? "{}") as Record<
+        string,
+        { email: string; name: string; password: string; createdAt: string }
+      >;
+    } catch {
+      return {};
+    }
+  }
+
+  function saveSession(profile: { email: string; name: string; provider: string }) {
+    window.localStorage.setItem(
+      authStorageKey,
+      JSON.stringify({
+        signedIn: true,
+        email: profile.email,
+        name: profile.name,
+        provider: profile.provider,
+        createdAt: new Date().toISOString(),
+      }),
+    );
+    onAuth();
+  }
+
+  async function submit() {
+    const safeEmail = email.trim().toLowerCase();
+    const safeName = name.trim() || "VantaFace User";
+    const safePassword = password.trim();
+
+    if (!safeEmail || !safeEmail.includes("@")) {
+      setMessage("Enter a valid email address.");
+      return;
+    }
+
+    if (safePassword.length < 4) {
+      setMessage("Password must be at least 4 characters.");
+      return;
+    }
+
+    if (supabase) {
+      setMessage("");
+
+      if (mode === "signup") {
+        const { error } = await supabase.auth.signUp({
+          email: safeEmail,
+          password: safePassword,
+          options: {
+            data: { name: safeName },
+            emailRedirectTo: window.location.origin,
+          },
+        });
+
+        if (error) {
+          setMessage(error.message);
+          return;
+        }
+
+        saveSession({ email: safeEmail, name: safeName, provider: "supabase-email" });
+        return;
+      }
+
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email: safeEmail,
+        password: safePassword,
+      });
+
+      if (error) {
+        setMessage(error.message);
+        return;
+      }
+
+      saveSession({
+        email: data.user?.email ?? safeEmail,
+        name: String(data.user?.user_metadata?.name ?? safeName),
+        provider: "supabase-email",
+      });
+      return;
+    }
+
+    const accounts = readAccounts();
+
+    if (mode === "signup") {
+      accounts[safeEmail] = {
+        email: safeEmail,
+        name: safeName,
+        password: safePassword,
+        createdAt: new Date().toISOString(),
+      };
+      window.localStorage.setItem(authAccountsKey, JSON.stringify(accounts));
+      saveSession({ email: safeEmail, name: safeName, provider: "local-preview" });
+      return;
+    }
+
+    const account = accounts[safeEmail];
+    if (!account) {
+      setMessage("No account found. Use Start Free to create one first.");
+      return;
+    }
+
+    if (account.password !== safePassword) {
+      setMessage("Password does not match this account.");
+      return;
+    }
+
+    saveSession({ email: account.email, name: account.name, provider: "local-preview" });
+  }
+
+  async function googleLogin() {
+    if (!supabase) {
+      setMessage("Google login is not connected yet. Add Supabase URL and publishable key.");
+      return;
+    }
+
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: "google",
+      options: {
+        redirectTo: window.location.origin,
+        queryParams: {
+          access_type: "offline",
+          prompt: "select_account",
+        },
+      },
+    });
+
+    if (error) {
+      setMessage(error.message);
+    }
+  }
+
+  function switchMode() {
+    setMode(mode === "login" ? "signup" : "login");
+    setMessage("");
+  }
+
+  return (
+    <section className="authStage" aria-label="VantaFace login">
+      <div className="authPhoto">
+        <div className="signalField" aria-hidden="true">
+          <span className="signalOrb one" />
+          <span className="signalOrb two" />
+          <span className="signalOrb three" />
+          <span className="signalLine one" />
+          <span className="signalLine two" />
+          <span className="signalLine three" />
+        </div>
+        <div className="authScrim" />
+        <div className="authHero">
+          <div className="authBadge">
+            <SignalGlyph />
+            <span>Built for disciplined self-improvement</span>
+          </div>
+          <h1>
+            <span>Find Signal to Action</span>
+            <span>Instantly</span>
+          </h1>
+        </div>
+      </div>
+      <div className="authPane">
+        <div className="authCard">
+          <div className="authWordmark">VantaFace</div>
+          <h2>{headline}</h2>
+          <p>
+            {mode === "login" ? (
+              <>
+                <b>Log in</b> to continue monitoring your signals.
+              </>
+            ) : (
+              subtitle
+            )}
+          </p>
+          {mode === "signup" && (
+            <label className="authField">
+              <span>Name</span>
+              <input
+                aria-label="Name"
+                autoComplete="name"
+                value={name}
+                onChange={(event) => setName(event.target.value)}
+                placeholder="Eg. John Doe"
+              />
+            </label>
+          )}
+          <label className="authField">
+            <span>Email address</span>
+            <input
+              aria-label="Email address"
+              autoComplete="email"
+              inputMode="email"
+              type="email"
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+              placeholder="Eg. johndoe@gmail.com"
+            />
+          </label>
+          <label className="authField">
+            <span>Password</span>
+            <input
+              aria-label="Password"
+              autoComplete={mode === "login" ? "current-password" : "new-password"}
+              type="password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              placeholder="Password"
+            />
+          </label>
+          {message && <div className="authMessage">{message}</div>}
+          <button className="authLoginButton" type="button" onClick={submit}>
+            <span>{mode === "login" ? "Login" : "Create Account"}</span>
+            <ArrowIcon />
+          </button>
+          <div className="authDivider">
+            <i />
+            <b>OR</b>
+            <i />
+          </div>
+          <button className="authGoogleButton" type="button" onClick={googleLogin}>
+            <GoogleIcon />
+            <span>Sign in with Google</span>
+          </button>
+          <p className="authBottom">
+            {mode === "login" ? "Don’t have an account? " : "Already have an account? "}
+            <button
+              type="button"
+              onClick={switchMode}
+            >
+              {mode === "login" ? "Start Free" : "Log in"}
+            </button>
+          </p>
+          <small className="authNote">
+            {isSupabaseConfigured
+              ? "Secure authentication is handled with Supabase. Google sign-in opens the official Google account flow."
+              : "Auth is not connected yet. Add Supabase public keys to enable Google sign-in."}
+          </small>
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -726,10 +993,12 @@ function ProfilePage({
   goals,
   focusAreas,
   onGoalClick,
+  onSignOut,
 }: {
   goals: Goals;
   focusAreas: string[];
   onGoalClick: () => void;
+  onSignOut: () => void;
 }) {
   return (
     <div className="profileLayout">
@@ -754,7 +1023,7 @@ function ProfilePage({
         <PanelHeader title="Settings" />
         <div className="settingsList">
           {profileSettings.map((item) => (
-            <button key={item} type="button">
+            <button key={item} type="button" onClick={item === "Sign Out" ? onSignOut : undefined}>
               {item}
               <span>›</span>
             </button>
@@ -1291,6 +1560,118 @@ function StepDots({ total, current }: { total: number; current: number }) {
       ))}
     </div>
   );
+}
+
+function SignalGlyph() {
+  return (
+    <svg viewBox="0 0 582 557" aria-hidden="true">
+      <path
+        fillRule="evenodd"
+        d="M449 0h-14l-20 10-215 239-13 27 2 23 23 27 20 6 57 2v182l12 27 23 13h22l28-20 199-225 9-23-3-24-20-24-20-7-61-3V32l-8-19ZM442 38l4 212 20 17 74 3 7 15-206 235-9 2-8-8-3-200-14-14-12-3h-62l-9-6-3-9ZM1 67l3 14 13 9h199l7-3 9-13-4-17-13-8H18L5 57ZM0 285l4 15 13 8h88l13-9 3-8-2-13-8-8-8-3H17l-13 8ZM1 495l3 16 6 6 13 3h156l12-4 9-16-4-12-14-9H18l-9 4Z"
+      />
+    </svg>
+  );
+}
+
+function ArrowIcon() {
+  return (
+    <svg viewBox="0 0 22 22" aria-hidden="true">
+      <path
+        d="M3 11h15.4M11 3.3l7.7 7.7-7.7 7.7"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="2.6"
+      />
+    </svg>
+  );
+}
+
+function GoogleIcon() {
+  return (
+    <svg viewBox="0 0 48 48" aria-hidden="true">
+      <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5Z" />
+      <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65Z" />
+      <path fill="#FBBC05" d="M10.53 28.59A14.5 14.5 0 0 1 9.76 24c0-1.59.28-3.14.77-4.59l-7.98-6.19A23.94 23.94 0 0 0 0 24c0 3.88.93 7.56 2.56 10.78l7.97-6.19Z" />
+      <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48Z" />
+    </svg>
+  );
+}
+
+function useAuthState() {
+  const [signedIn, setSignedIn] = useState(false);
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    let mounted = true;
+
+    function setLocalSessionFromSupabaseUser(user: {
+      email?: string | null;
+      user_metadata?: { name?: string; full_name?: string; avatar_url?: string };
+    }) {
+      window.localStorage.setItem(
+        authStorageKey,
+        JSON.stringify({
+          signedIn: true,
+          email: user.email ?? "",
+          name:
+            user.user_metadata?.name ??
+            user.user_metadata?.full_name ??
+            user.email?.split("@")[0] ??
+            "VantaFace User",
+          provider: "supabase",
+          createdAt: new Date().toISOString(),
+        }),
+      );
+    }
+
+    if (supabase) {
+      supabase.auth.getSession().then(({ data }) => {
+        if (!mounted) return;
+
+        if (data.session?.user) {
+          setLocalSessionFromSupabaseUser(data.session.user);
+          setSignedIn(true);
+        } else {
+          setSignedIn(false);
+        }
+        setReady(true);
+      });
+
+      const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+        if (!mounted) return;
+
+        if (session?.user) {
+          setLocalSessionFromSupabaseUser(session.user);
+          setSignedIn(true);
+        } else {
+          window.localStorage.removeItem(authStorageKey);
+          setSignedIn(false);
+        }
+        setReady(true);
+      });
+
+      return () => {
+        mounted = false;
+        listener.subscription.unsubscribe();
+      };
+    }
+
+    try {
+      const stored = window.localStorage.getItem(authStorageKey);
+      if (stored) setSignedIn(Boolean(JSON.parse(stored)?.signedIn));
+    } catch {
+      setSignedIn(false);
+    } finally {
+      setReady(true);
+    }
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  return [ready && signedIn, setSignedIn] as const;
 }
 
 function usePersistentState() {
